@@ -2979,8 +2979,17 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 				  }
 				  break;
 			case 'l': CHECK_VALUE(user_param->post_list,int,"Send Post List size",not_int_ptr); break;
+			/* -D 参数: 设置测试持续时间（秒）
+			 * 设置 test_type 为 DURATION 模式，而不是默认的 ITERATIONS 模式
+			 * 在 DURATION 模式下：
+			 * - 测试运行指定的秒数而不是固定迭代次数
+			 * - 使用 SIGALRM 信号控制测试阶段 (warmup/sample/end)
+			 * - margin 参数定义预热和采样边界
+			 */
 			case 'D': CHECK_VALUE_POSITIVE(user_param->duration,int,"Duration period",not_int_ptr);
 				  user_param->test_type = DURATION;
+				  fprintf(stderr, "[DEBUG] parser: -D %d seconds, test_type set to DURATION\n",
+					  user_param->duration);
 				  break;
 			case 'f': CHECK_VALUE_NON_NEGATIVE(user_param->margin,int,"Margin",not_int_ptr); break;
 			case 'O':
@@ -2997,7 +3006,16 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 				  }
 				  return HELP_EXIT;
 			case 'z': user_param->use_rdma_cm = ON; break;
-			case 'R': user_param->work_rdma_cm = ON; break;
+			/* -R 参数: 启用 RDMA CM (Connection Manager) 工作模式
+			 * work_rdma_cm = ON 表示使用 RDMA CM 来建立连接
+			 * RDMA CM 提供了类似 socket 的连接管理接口：
+			 * - 使用 rdma_create_id, rdma_resolve_addr, rdma_resolve_route
+			 * - 自动处理 QP 状态转换 (INIT->RTR->RTS)
+			 * - 简化了连接建立过程
+			 */
+			case 'R': user_param->work_rdma_cm = ON;
+				  fprintf(stderr, "[DEBUG] parser: -R enabled, using RDMA CM for connection\n");
+				  break;
 			case 's': size_len = (int)strlen(optarg);
 				  if (optarg[size_len-1] == 'K') {
 					  optarg[size_len-1] = '\0';

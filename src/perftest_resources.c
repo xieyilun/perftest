@@ -3543,7 +3543,19 @@ static void ctx_post_send_work_request_func_pointer(struct pingpong_context *ctx
 #endif
 
 /******************************************************************************
+ * ctx_set_send_reg_wqes - 设置发送工作队列元素 (WQE)
  *
+ * 功能说明：
+ * 为所有 QP 准备发送工作请求 (Work Requests)，配置 RDMA 操作所需的参数
+ *
+ * 关键配置项（针对 RDMA WRITE 非 immediate 模式）：
+ * - 本地内存地址 (sge_list[].addr): 从 ctx->buf[] 获取
+ * - 本地内存长度 (sge_list[].length): user_param->size
+ * - 本地key (sge_list[].lkey): 从 MR (ctx->mr[]) 获取
+ * - 远程内存地址 (wr.rdma.remote_addr): 从 rem_dest[].vaddr 获取
+ * - 远程key (wr.rdma.rkey): 从 rem_dest[].rkey 获取
+ * - 操作码 (wr.opcode): IBV_WR_RDMA_WRITE (对于 WRITE verb)
+ * - 完成标志 (send_flags): 根据 cq_mod 设置 IBV_SEND_SIGNALED
  ******************************************************************************/
 void ctx_set_send_reg_wqes(struct pingpong_context *ctx,
 		struct perftest_parameters *user_param,
@@ -3553,6 +3565,10 @@ void ctx_set_send_reg_wqes(struct pingpong_context *ctx,
 	int num_of_qps = user_param->num_of_qps;
 	int xrc_offset = 0;
 	uint32_t remote_qkey;
+
+	fprintf(stderr, "[DEBUG] ctx_set_send_reg_wqes: Configuring WQEs for %d QPs\n", num_of_qps);
+	fprintf(stderr, "[DEBUG] ctx_set_send_reg_wqes: verb=%d (WRITE=%d), size=%lu, post_list=%d\n",
+		user_param->verb, WRITE, user_param->size, user_param->post_list);
 
 	if((user_param->use_xrc || user_param->connection_type == DC) && (user_param->duplex || user_param->tst == LAT)) {
 		num_of_qps /= 2;
@@ -3576,9 +3592,14 @@ void ctx_set_send_reg_wqes(struct pingpong_context *ctx,
 			}
 		}
 
-		if (user_param->verb == WRITE || user_param->verb == WRITE_IMM || user_param->verb == READ)
+		/* 对于 RDMA 操作（WRITE/READ），设置远程内存地址
+		 * remote_addr 指向对端的内存地址，数据将被写入此地址（WRITE）或从此地址读取（READ）
+		 */
+		if (user_param->verb == WRITE || user_param->verb == WRITE_IMM || user_param->verb == READ) {
 			ctx->wr[i*user_param->post_list].wr.rdma.remote_addr   = rem_dest[xrc_offset + i].vaddr;
-
+			fprintf(stderr, "[DEBUG] ctx_set_send_reg_wqes: QP[%d] remote_addr=0x%lx\n",
+				i, rem_dest[xrc_offset + i].vaddr);
+		}
 		else if (user_param->verb == ATOMIC)
 			ctx->wr[i*user_param->post_list].wr.atomic.remote_addr = rem_dest[xrc_offset + i].vaddr;
 
@@ -3629,9 +3650,17 @@ void ctx_set_send_reg_wqes(struct pingpong_context *ctx,
 			else {
 				ctx->wr[i*user_param->post_list + j].opcode = opcode_verbs_array[user_param->verb];
 			}
+			/* 对于 RDMA WRITE/READ 操作，配置 RDMA 特定参数
+			 * rkey: 远程内存区域的保护key，用于验证访问权限
+			 *       必须与对端注册 MR 时生成的 key 匹配
+			 */
 			if (user_param->verb == WRITE || user_param->verb == WRITE_IMM || user_param->verb == READ) {
 
 				ctx->wr[i*user_param->post_list + j].wr.rdma.rkey = rem_dest[xrc_offset + i].rkey;
+				if (j == 0) {
+					fprintf(stderr, "[DEBUG] ctx_set_send_reg_wqes: QP[%d] WR[%d] rkey=0x%x\n",
+						i, j, rem_dest[xrc_offset + i].rkey);
+				}
 				if (user_param->connection_type == SRD)
 					ctx->rem_qpn[xrc_offset + i] = rem_dest[xrc_offset + i].qpn;
 				if (j > 0) {
@@ -3966,18 +3995,32 @@ cleaning:
 }
 
 /******************************************************************************
+ * run_iter_bw - 执行带宽测试的主循环
  *
+ * 功能说明：
+ * 这是带宽测试的核心函数，负责：
+ * 1. post 发送请求 (ibv_post_send)
+ * 2. poll 完成队列获取完成状态 (ibv_poll_cq)
+ * 3. 根据 test_type 决定运行模式：
+ *    - DURATION: 运行指定时间（如 -D 60 表示 60 秒）
+ *    - ITERATIONS: 运行固定迭代次数
+ * 4. 收集性能数据用于计算带宽和消息速率
+ *
+ * 对于 RDMA WRITE（非 immediate）：
+ * - 只需 post send 和 poll send CQ
+ * - 不需要在接收端 post receive 或 poll recv CQ
+ * - 数据直接写入远程内存，无需接收端参与
  ******************************************************************************/
 int run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user_param)
 {
-	uint64_t           	totscnt = 0;
-	uint64_t       	   	totccnt = 0;
+	uint64_t           	totscnt = 0;  /* total send count - 总发送计数 */
+	uint64_t       	   	totccnt = 0;  /* total completion count - 总完成计数 */
 	int                	i = 0;
 	int			index;
-	int			ne = 0;
-	uint64_t	   	tot_iters;
+	int			ne = 0;  /* number of completions polled - poll到的完成数 */
+	uint64_t	   	tot_iters;  /* total iterations for test - 总迭代次数 */
 	int			err = 0;
-	struct ibv_wc 	   	*wc = NULL;
+	struct ibv_wc 	   	*wc = NULL;  /* work completion array - 工作完成数组 */
 	int 			num_of_qps = user_param->num_of_qps;
 	/* Rate Limiter*/
 	int 			rate_limit_pps = 0;
@@ -4007,16 +4050,28 @@ int run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user_pa
 	#endif
 
 	ALLOCATE(wc ,struct ibv_wc ,dyn_ctx->config.max);
+
+	/* DURATION 模式初始化：
+	 * 使用 SIGALRM 信号控制测试阶段转换
+	 * 状态转换：START_STATE -> SAMPLE_STATE -> STOP_SAMPLE_STATE -> END_STATE
+	 * margin: 预热时间，在此期间的数据不计入统计
+	 * duration: 总持续时间
+	 * 采样窗口 = duration - 2*margin (前后各有 margin 时间不计入统计)
+	 */
 	if (user_param->test_type == DURATION) {
+		fprintf(stderr, "[DEBUG] run_iter_bw: DURATION mode, duration=%d seconds, margin=%d seconds\n",
+			user_param->duration, user_param->margin);
 		duration_param=user_param;
 		duration_param->state = START_STATE;
-		signal(SIGALRM, catch_alarm);
+		signal(SIGALRM, catch_alarm);  /* 注册信号处理函数 */
 		if (user_param->margin > 0 )
-			alarm(user_param->margin);
+			alarm(user_param->margin);  /* margin 秒后触发，进入 SAMPLE_STATE */
 		else
 			catch_alarm(0); /* move to next state */
 
-		user_param->iters = 0;
+		user_param->iters = 0;  /* DURATION 模式下 iters 用作计数器 */
+		fprintf(stderr, "[DEBUG] run_iter_bw: Started timing, will warm up for %d seconds\n",
+			user_param->margin);
 	}
 
 	if (user_param->duplex && (user_param->use_xrc || user_param->connection_type == DC))
@@ -4062,11 +4117,22 @@ int run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user_pa
 		gap_cycles = cpu_mhz * gap_time;
 	}
 
-	/* main loop for posting */
+	/* 主循环：持续 post 发送请求并 poll 完成
+	 *
+	 * 注意：此函数只在 CLIENT 端执行（对于普通 RDMA WRITE）
+	 * SERVER 端不会调用此函数，而是等待 CLIENT 完成
+	 *
+	 * 循环条件：
+	 * - ITERATIONS 模式: 直到发送和完成的总数都达到 tot_iters
+	 * - DURATION 模式: 直到状态变为 END_STATE（由 SIGALRM 信号触发）
+	 */
+	fprintf(stderr, "[DEBUG] run_iter_bw [CLIENT]: Entering main loop, tot_iters=%lu\n", tot_iters);
+	fprintf(stderr, "[DEBUG] run_iter_bw [CLIENT]: Will post WRITE requests and poll send CQ\n");
+
 	while (totscnt < tot_iters  || totccnt < tot_iters ||
 		(user_param->test_type == DURATION && user_param->state != END_STATE) ) {
 
-		/* main loop to run over all the qps and post each time n messages */
+		/* 遍历所有 QP，为每个 QP post 消息 */
 		for (index =0 ; index < num_of_qps ; index++) {
 			if (user_param->rate_limit_type == SW_RATE_LIMIT && is_sending_burst == 0) {
 				if (gap_deadline > get_cycles()) {
@@ -4098,9 +4164,26 @@ int run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user_pa
 				if (user_param->test_type == DURATION && user_param->state == END_STATE)
 					break;
 
+				/* post_send_method: CLIENT 提交 RDMA WRITE 请求
+				 *
+				 * 对于 RDMA WRITE 操作，调用 ibv_post_send():
+				 * 1. 将 WQE 提交到 CLIENT 端 QP 的发送队列
+				 * 2. HCA 硬件读取 WQE，获取以下信息：
+				 *    - 本地内存地址和 lkey (从 sge_list)
+				 *    - 远程内存地址和 rkey (从 wr.rdma)
+				 *    - 数据长度和操作码
+				 * 3. HCA 通过 RDMA 网络将数据从 CLIENT 本地内存写入 SERVER 远程内存
+				 * 4. 操作完成后，在 CLIENT 的 send CQ 中生成完成事件
+				 *    （如果设置了 IBV_SEND_SIGNALED）
+				 *
+				 * SERVER 端完全无感知：
+				 * - 不需要 CPU 参与
+				 * - 不需要软件处理
+				 * - 数据直接由 HCA 硬件写入内存
+				 */
 				err = post_send_method(ctx, index, user_param);
 				if (err) {
-					fprintf(stderr,"Couldn't post send: qp %d scnt=%lu \n",index,ctx->scnt[index]);
+					fprintf(stderr,"[CLIENT] Couldn't post send: qp %d scnt=%lu \n",index,ctx->scnt[index]);
 					return_value = FAILURE;
 					goto cleaning;
 				}
@@ -4150,6 +4233,21 @@ int run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user_pa
 			}
 		}
 
+		/* Poll 发送完成队列，获取已完成的 RDMA WRITE 操作
+		 *
+		 * CLIENT 端 polling 行为：
+		 * - 调用 ibv_poll_cq(ctx->send_cq) 检查 WRITE 操作是否完成
+		 * - 完成事件 (CQE) 包含：
+		 *   - wc.status: 操作状态（IBV_WC_SUCCESS 表示成功）
+		 *   - wc.wr_id: 标识哪个 WQE 完成了
+		 * - 完成事件表示数据已成功从 CLIENT 写入 SERVER 的远程内存
+		 *
+		 * 关键点：
+		 * - 只需 poll CLIENT 的 send CQ
+		 * - 不需要 poll recv CQ（因为是单边操作）
+		 * - SERVER 端完全不需要 poll CQ
+		 * - ne 返回本次 poll 到的完成数量
+		 */
 		if (totccnt < tot_iters || (user_param->test_type == DURATION &&  totccnt < totscnt)) {
 				/* Make sure all completions from previous event were polled before waiting for another */
 				if (user_param->use_event && ne == 0) {
@@ -4159,7 +4257,9 @@ int run_iter_bw(struct pingpong_context *ctx,struct perftest_parameters *user_pa
 						goto cleaning;
 					}
 				}
-				/* Dynamic CQE poll size adaptation */
+				/* Dynamic CQE poll size adaptation
+				 * 动态调整每次 poll 的 CQE 数量以优化性能
+				 */
 				ne = poll_completions(
 					ctx->send_cq,
 					wc,

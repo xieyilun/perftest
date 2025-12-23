@@ -1152,6 +1152,20 @@ struct ibv_context* ctx_open_device(struct ibv_device *ib_dev, struct perftest_p
 /******************************************************************************
  *
  ******************************************************************************/
+/* alloc_ctx 函数: 分配测试上下文所需的所有资源
+ *
+ * 这个函数是内存分配的核心入口，负责分配：
+ * 1. 数据缓冲区指针数组（ctx->buf）
+ * 2. 实际的数据缓冲区（通过 memory_create 回调）
+ * 3. QP、MR、WQE 等 RDMA 资源的指针数组
+ * 4. 时间戳和计数器数组
+ *
+ * CLIENT 和 SERVER 的内存使用区别：
+ * - CLIENT: 需要发送缓冲区（源数据）+ 接收缓冲区（如果双工模式）
+ * - SERVER: 需要接收缓冲区（被 CLIENT WRITE 的目标内存）
+ *
+ * 内存分配后会被注册为 MR（Memory Region），使得 RDMA 硬件可以访问
+ */
 int alloc_ctx(struct pingpong_context *ctx,struct perftest_parameters *user_param)
 {
 	uint64_t tarr_size;
@@ -1159,14 +1173,20 @@ int alloc_ctx(struct pingpong_context *ctx,struct perftest_parameters *user_para
 	ctx->cycle_buffer = user_param->cycle_buffer;
 	ctx->cache_line_size = user_param->cache_line_size;
 
+	/* 分配每个 QP 的端口映射数组 */
 	ALLOC(user_param->port_by_qp, uint64_t, user_param->num_of_qps);
 
+	/* 分配时间戳数组，用于性能测量
+	 * - BW 测试：记录每次迭代的开始时间
+	 * - LAT 测试：记录发送和接收时间戳
+	 */
 	tarr_size = (user_param->noPeak) ? 1 : user_param->iters*user_param->num_of_qps;
 	ALLOC(user_param->tposted, cycles_t, tarr_size);
 	memset(user_param->tposted, 0, sizeof(cycles_t)*tarr_size);
 	if ((user_param->tst == LAT || user_param->tst == FS_RATE) && user_param->test_type == DURATION)
 		ALLOC(user_param->tcompleted, cycles_t, 1);
 
+	/* 分配 QP 指针数组，每个 QP 对应一个通信通道 */
 	ALLOC(ctx->qp, struct ibv_qp*, user_param->num_of_qps);
 	#ifdef HAVE_IBV_WR_API
 	ALLOC(ctx->qpx, struct ibv_qp_ex*, user_param->num_of_qps);
@@ -1187,7 +1207,21 @@ int alloc_ctx(struct pingpong_context *ctx,struct perftest_parameters *user_para
 	ALLOC(ctx->t10dif_sig, struct mlx5dv_sig_t10dif, 1);
 	#endif
 	#endif
+	/* 分配 MR (Memory Region) 指针数组
+	 * MR 是注册后的内存区域，包含 lkey 和 rkey
+	 * - CLIENT: MR 用于本地数据访问（lkey）
+	 * - SERVER: MR 的 rkey 需要发送给 CLIENT，供 RDMA WRITE 使用
+	 */
 	ALLOC(ctx->mr, struct ibv_mr*, user_param->num_of_qps);
+
+	/* 【关键】分配数据缓冲区指针数组
+	 * ctx->buf[i] 将指向实际分配的内存缓冲区
+	 * 这里只分配指针数组，实际内存在后面通过 memory_create 分配
+	 *
+	 * 在 RDMA WRITE 测试中：
+	 * - CLIENT: ctx->buf[] 存放要写入的源数据
+	 * - SERVER: ctx->buf[] 是被 CLIENT WRITE 的目标内存
+	 */
 	ALLOC(ctx->buf, void*, user_param->num_of_qps);
 
 	if ((user_param->tst == BW || user_param->tst == LAT_BY_BW) && (user_param->machine == CLIENT || user_param->duplex)) {
@@ -1238,11 +1272,31 @@ int alloc_ctx(struct pingpong_context *ctx,struct perftest_parameters *user_para
 
 	num_of_qps_factor = (user_param->mr_per_qp) ? 1 : user_param->num_of_qps;
 
-	/* holds the size of maximum between msg size and cycle buffer,
-	 * aligned to cache line, it is multiplied by 2 to be used as
-	 * send buffer(first half) and receive buffer(second half)
-	 * with reference to number of flows and number of QPs
+	/* 【关键】计算缓冲区大小
+	 * 这是决定分配多少内存的核心计算
+	 *
+	 * 计算公式解析：
+	 * 1. BUFF_SIZE(size, cycle_buffer): 取消息大小和循环缓冲区的最大值
+	 * 2. INC(..., cache_line_size): 向上对齐到缓存行大小（通常 64 字节）
+	 *    - 对齐到缓存行可以避免 false sharing，提高性能
+	 * 3. * 2: 乘以 2，因为需要发送缓冲区和接收缓冲区
+	 *    - 前半部分：发送缓冲区（CLIENT 用于 RDMA WRITE 的源数据）
+	 *    - 后半部分：接收缓冲区（SERVER 用于接收 RDMA WRITE 的目标内存）
+	 * 4. * num_of_qps_factor: 根据 QP 数量调整
+	 * 5. * flows: 根据流数量调整
+	 *
+	 * 示例（-s 64K 参数）：
+	 * - user_param->size = 65536 字节（64KB）
+	 * - 对齐到 64 字节后 = 65536
+	 * - * 2（发送+接收）= 131072 字节
+	 * - 如果有多个 QP 或 flows，还会进一步扩大
 	 */
+	fprintf(stderr, "[DEBUG] alloc_ctx [%s]: Calculating buffer size...\n",
+		user_param->machine == SERVER ? "SERVER" : "CLIENT");
+	fprintf(stderr, "[DEBUG]   - Message size (-s): %lu bytes\n", user_param->size);
+	fprintf(stderr, "[DEBUG]   - Cache line size: %d bytes\n", ctx->cache_line_size);
+	fprintf(stderr, "[DEBUG]   - Number of QPs: %d\n", user_param->num_of_qps);
+
 	ctx->buff_size = INC(BUFF_SIZE(ctx->size, ctx->cycle_buffer),
 				 ctx->cache_line_size) * 2 * num_of_qps_factor * user_param->flows;
 	ctx->send_qp_buff_size = ctx->buff_size / num_of_qps_factor / 2;
@@ -1251,7 +1305,49 @@ int alloc_ctx(struct pingpong_context *ctx,struct perftest_parameters *user_para
 	if (user_param->connection_type == UD)
 		ctx->buff_size += ctx->cache_line_size;
 
+	fprintf(stderr, "[DEBUG]   - Calculated total buffer size: %lu bytes (%.2f KB)\n",
+		ctx->buff_size, ctx->buff_size / 1024.0);
+
+	/* 【关键】实际分配内存缓冲区
+	 * memory_create 是一个函数指针回调，根据不同的内存类型调用不同的分配函数：
+	 * - host_memory_create(): 标准主机内存（最常见）
+	 *   - 使用 memalign() 或 posix_memalign() 分配对齐内存
+	 *   - 或者使用 hugepages (2MB 大页) 提高性能
+	 * - cuda_memory_create(): GPU 设备内存（CUDA）
+	 * - rocm_memory_create(): GPU 设备内存（ROCm）
+	 * - 等等...
+	 *
+	 * 分配流程（以 host_memory_create 为例）：
+	 * 1. 创建 memory_ctx 对象
+	 * 2. 设置回调函数指针（init, allocate_buffer, free_buffer, copy 等）
+	 * 3. 后续调用 memory->allocate_buffer() 分配实际的物理内存
+	 * 4. 分配的内存地址会保存到 ctx->buf[i]
+	 * 5. 然后调用 ibv_reg_mr() 注册为 MR，使 RDMA 硬件可以访问
+	 *
+	 * 在 RDMA WRITE 测试中：
+	 * - CLIENT: 分配源数据缓冲区，将从这里读取数据执行 RDMA WRITE
+	 * - SERVER: 分配目标内存缓冲区，CLIENT 的 RDMA WRITE 会直接写入这里
+	 *           SERVER 的 CPU 完全不参与数据传输过程（零拷贝）
+	 */
+	fprintf(stderr, "[DEBUG] alloc_ctx [%s]: Allocating physical memory via memory_create callback...\n",
+		user_param->machine == SERVER ? "SERVER" : "CLIENT");
+	fprintf(stderr, "[DEBUG]   - Memory type: %s\n",
+		user_param->memory_type == MEMORY_HOST ? "HOST" :
+		user_param->memory_type == MEMORY_CUDA ? "CUDA" :
+		user_param->memory_type == MEMORY_ROCM ? "ROCm" : "OTHER");
+
 	ctx->memory = user_param->memory_create(user_param);
+
+	if (ctx->memory == NULL) {
+		fprintf(stderr, "[ERROR] alloc_ctx [%s]: Failed to create memory context!\n",
+			user_param->machine == SERVER ? "SERVER" : "CLIENT");
+		return FAILURE;
+	}
+
+	fprintf(stderr, "[DEBUG] alloc_ctx [%s]: Memory allocation completed successfully\n",
+		user_param->machine == SERVER ? "SERVER" : "CLIENT");
+	fprintf(stderr, "[DEBUG]   - Total allocated: %lu bytes (%.2f KB, %.2f MB)\n",
+		ctx->buff_size, ctx->buff_size / 1024.0, ctx->buff_size / (1024.0 * 1024.0));
 
 	return SUCCESS;
 }

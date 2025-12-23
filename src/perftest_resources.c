@@ -1933,11 +1933,28 @@ static struct ibv_mr *register_mr_ex(struct pingpong_context *ctx,
 }
 #endif
 
+/* register_mr 函数: 注册内存区域（Memory Region, MR）
+ * MR 注册是 RDMA 操作的核心步骤，使内存可以被 RDMA 硬件访问
+ *
+ * 参数说明：
+ * - ctx: RDMA 上下文，包含 PD 和缓冲区
+ * - user_param: 用户配置参数
+ * - qp_index: QP 索引，用于定位对应的缓冲区
+ * - flags: 访问权限标志（LOCAL_WRITE, REMOTE_WRITE, REMOTE_READ 等）
+ * - dmabuf_fd: DMA-BUF 文件描述符（GPU 内存等特殊情况）
+ * - dmabuf_offset: DMA-BUF 偏移量
+ *
+ * 返回值：
+ * - 成功返回 ibv_mr 指针，包含 lkey 和 rkey
+ * - lkey: 本地访问密钥，用于本地 RDMA 操作
+ * - rkey: 远程访问密钥，需要传递给对端用于 RDMA WRITE/READ
+ */
 static struct ibv_mr *register_mr(struct pingpong_context *ctx,
 				   struct perftest_parameters *user_param,
 				   int qp_index, int flags, int dmabuf_fd,
 				   uint64_t dmabuf_offset)
 {
+	/* 判断是否使用 DMABUF（GPU 内存或其他设备内存） */
 	if (dmabuf_fd) {
 #ifdef HAVE_REG_DMABUF_MR
 		/* DMABUF registration using standard API */
@@ -1968,11 +1985,44 @@ static struct ibv_mr *register_mr(struct pingpong_context *ctx,
 		return NULL;
 #endif
 	} else {
-		/* Regular memory registration using standard API */
+		/* 标准内存注册流程（最常见的情况）
+		 * ibv_reg_mr 是 RDMA 核心 API，向 NIC 注册一段内存
+		 *
+		 * 参数：
+		 * - ctx->pd: Protection Domain，内存保护域
+		 * - ctx->buf[qp_index]: 要注册的内存起始地址
+		 * - ctx->buff_size: 内存区域大小
+		 * - flags: 访问权限标志
+		 *
+		 * 在 RDMA WRITE 场景中：
+		 * - CLIENT: 注册本地内存用于发送数据（需要 LOCAL_WRITE 权限）
+		 * - SERVER: 注册远程内存供 CLIENT 写入（需要 REMOTE_WRITE 权限）
+		 *           SERVER 的 rkey 会通过参数交换发送给 CLIENT
+		 *           CLIENT 使用这个 rkey 在 WQE 中指定目标内存
+		 */
+		fprintf(stderr, "[DEBUG] register_mr [%s]: Registering MR with ibv_reg_mr()\n",
+		        user_param->machine == SERVER ? "SERVER" : "CLIENT");
+		fprintf(stderr, "[DEBUG] register_mr: addr=%p, size=%lu, flags=0x%x\n",
+		        ctx->buf[qp_index], ctx->buff_size, flags);
+
 		return ibv_reg_mr(ctx->pd, ctx->buf[qp_index], ctx->buff_size, flags);
 	}
 }
 
+/* register_memory_region 函数: MR 注册的统一入口
+ * 这是一个包装函数，根据不同的配置选择合适的注册方法
+ *
+ * MR 注册流程概述：
+ * 1. 选择注册函数（标准 API vs 扩展 API）
+ * 2. 执行注册操作
+ * 3. 保存 MR 指针到 ctx->mr[qp_index]
+ * 4. CLIENT 和 SERVER 都需要注册自己的内存
+ *
+ * 注册成功后：
+ * - MR 包含 lkey 和 rkey
+ * - CLIENT 需要 SERVER 的 rkey 来执行 RDMA WRITE
+ * - 这个 rkey 通过参数交换（ctx_hand_shake）传递
+ */
 static int register_memory_region(struct pingpong_context *ctx,
 				  struct perftest_parameters *user_param,
 				  int qp_index, int flags, int dmabuf_fd,
@@ -1980,33 +2030,44 @@ static int register_memory_region(struct pingpong_context *ctx,
 {
 	struct ibv_mr *mr = NULL;
 
-	/* Select the appropriate registration function */
-	struct ibv_mr *(*register_func)(struct pingpong_context *ctx, 
+	/* 定义函数指针：用于选择不同的注册函数 */
+	struct ibv_mr *(*register_func)(struct pingpong_context *ctx,
 					struct perftest_parameters *user_param,
-					int qp_index, int flags, int dmabuf_fd, 
+					int qp_index, int flags, int dmabuf_fd,
 					uint64_t dmabuf_offset);
 
+	fprintf(stderr, "[DEBUG] register_memory_region [%s]: Starting MR registration for QP #%d\n",
+	        user_param->machine == SERVER ? "SERVER" : "CLIENT", qp_index);
+
 #ifdef HAVE_REG_MR_EX
-	/* Use extended API unless data_direct is requested (requires mlx5dv_reg_dmabuf_mr) */
+	/* 优先使用扩展 API（支持 TPH 等高级特性）
+	 * 除非使用 data_direct（需要特殊的 mlx5dv_reg_dmabuf_mr）
+	 */
 	if (!(user_param->use_data_direct && dmabuf_fd)) {
 		register_func = register_mr_ex;
+		fprintf(stderr, "[DEBUG] register_memory_region: Using extended API (register_mr_ex)\n");
 	} else {
 		register_func = register_mr;
+		fprintf(stderr, "[DEBUG] register_memory_region: Using standard API (register_mr) for data_direct\n");
 	}
 #else
-	/* Use legacy registration when extended API is not available */
+	/* 没有扩展 API 时使用标准注册方法 */
 	register_func = register_mr;
+	fprintf(stderr, "[DEBUG] register_memory_region: Using standard API (register_mr)\n");
 #endif
 
+	/* 执行 MR 注册 */
 	mr = register_func(ctx, user_param, qp_index, flags, dmabuf_fd, dmabuf_offset);
 
+	/* 如果扩展 API 不支持，回退到标准 API */
 	if (!mr && (errno == EOPNOTSUPP || errno == EPROTONOSUPPORT) &&
 	    register_func != register_mr) {
-		/* If extended registration is not supported, fall back to standard registration */
+		fprintf(stderr, "[DEBUG] register_memory_region: Extended API not supported, falling back to standard API\n");
 		register_func = register_mr;
 		mr = register_func(ctx, user_param, qp_index, flags, dmabuf_fd, dmabuf_offset);
 	}
 
+	/* 注册失败处理 */
 	if (!mr) {
 		fprintf(stderr, "Couldn't allocate MR with error=%d\n", errno);
 
@@ -2018,8 +2079,18 @@ static int register_memory_region(struct pingpong_context *ctx,
 		return FAILURE;
 	}
 
+	/* 保存 MR 指针到上下文
+	 * 这个 MR 包含：
+	 * - lkey: 用于本地 RDMA 操作
+	 * - rkey: 用于远程 RDMA 操作（SERVER 的 rkey 需要传给 CLIENT）
+	 */
 	ctx->mr[qp_index] = mr;
+	fprintf(stderr, "[DEBUG] register_memory_region [%s]: MR registered successfully\n",
+	        user_param->machine == SERVER ? "SERVER" : "CLIENT");
+	fprintf(stderr, "[DEBUG] register_memory_region: lkey=0x%x, rkey=0x%x\n",
+	        mr->lkey, mr->rkey);
 
+	/* 清理 DMABUF 文件描述符 */
 	if (dmabuf_fd) {
 		close(dmabuf_fd);
 	}
@@ -2384,12 +2455,23 @@ int ctx_init(struct pingpong_context *ctx, struct perftest_parameters *user_para
 		}
 	}
 
-	/* Allocating the Protection domain. */
-	ctx->pd = ibv_alloc_pd(ctx->context);
+	/* Allocating the Protection domain.
+	 * PD (Protection Domain) 保护域：
+	 * - 作用：隔离不同应用程序的 RDMA 资源
+	 * - PD 是 MR (Memory Region) 和 QP (Queue Pair) 的容器
+	 * - 同一个 PD 内的 QP 可以访问该 PD 内注册的 MR
+	 * - 不同 PD 之间的资源是隔离的，提供安全性
+	 * - CLIENT 和 SERVER 各自有自己的 PD
+	 */
+	fprintf(stderr, "[DEBUG] ctx_init [%s]: Allocating Protection Domain (PD)...\n",
+		user_param->machine == SERVER ? "SERVER" : "CLIENT");
+	ctx->pd = ibv_alloc_pd(ctx->context);  // 从设备上下文分配 PD
 	if (!ctx->pd) {
 		fprintf(stderr, "Couldn't allocate PD\n");
 		goto comp_channel;
 	}
+	fprintf(stderr, "[DEBUG] ctx_init [%s]: PD allocated successfully\n",
+		user_param->machine == SERVER ? "SERVER" : "CLIENT");
 
 	#ifdef HAVE_TD_API
 	/* Allocating the Thread domain, Parent domain. */

@@ -3005,7 +3005,16 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 					  usage_raw_ethernet(user_param->tst);
 				  }
 				  return HELP_EXIT;
-			case 'z': user_param->use_rdma_cm = ON; break;
+			case 'z': /* -z 参数: 使用 RDMA CM 进行连接管理（基础模式）
+				   * use_rdma_cm = ON 启用 RDMA CM
+				   * 注意：-z 和 -R 的区别：
+				   * - -z (use_rdma_cm): 基础 RDMA CM 模式
+				   * - -R (work_rdma_cm): 完整 RDMA CM 工作模式，包含资源创建
+				   * 通常使用 -R 参数更常见
+				   */
+				  user_param->use_rdma_cm = ON;
+				  fprintf(stderr, "[DEBUG] parser: -z enabled, use_rdma_cm=ON\n");
+				  break;
 			/* -R 参数: 启用 RDMA CM (Connection Manager) 工作模式
 			 * work_rdma_cm = ON 表示使用 RDMA CM 来建立连接
 			 * RDMA CM 提供了类似 socket 的连接管理接口：
@@ -3016,6 +3025,12 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 			case 'R': user_param->work_rdma_cm = ON;
 				  fprintf(stderr, "[DEBUG] parser: -R enabled, using RDMA CM for connection\n");
 				  break;
+			/* -s 参数: 设置消息大小（bytes）
+			 * 支持后缀 K (KB) 或 M (MB)
+			 * 例如：-s 64K 表示 65536 字节
+			 *      -s 1M 表示 1048576 字节
+			 * 消息大小决定每次 RDMA WRITE 传输的数据量
+			 */
 			case 's': size_len = (int)strlen(optarg);
 				  if (optarg[size_len-1] == 'K') {
 					  optarg[size_len-1] = '\0';

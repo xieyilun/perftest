@@ -2882,6 +2882,29 @@ error:
 /******************************************************************************
 *
 ******************************************************************************/
+/* create_rdma_cm_connection 函数: 使用 RDMA CM 建立连接
+ * RDMA CM 提供类似 socket 的连接管理接口，简化 QP 连接过程
+ *
+ * 连接流程（CLIENT 和 SERVER 的区别）：
+ *
+ * CLIENT（主动端）：
+ * 1. rdma_resolve_addr: 解析 SERVER 地址
+ * 2. rdma_resolve_route: 解析到达 SERVER 的路由
+ * 3. rdma_connect: 向 SERVER 发起连接请求
+ * 4. 等待 RDMA_CM_EVENT_ESTABLISHED 事件
+ *
+ * SERVER（被动端）：
+ * 1. rdma_bind_addr: 绑定监听地址
+ * 2. rdma_listen: 开始监听连接请求
+ * 3. 等待 RDMA_CM_EVENT_CONNECT_REQUEST 事件
+ * 4. rdma_accept: 接受 CLIENT 的连接请求
+ * 5. 等待 RDMA_CM_EVENT_ESTABLISHED 事件
+ *
+ * 关键优势：
+ * - RDMA CM 自动处理 QP 状态转换（INIT→RTR→RTS）
+ * - 无需手动设置 QP 属性（如 remote_qpn, dlid, dgid 等）
+ * - 简化了参数交换过程
+ */
 int create_rdma_cm_connection(struct pingpong_context *ctx,
 		struct perftest_parameters *user_param, struct perftest_comm *comm,
 		struct pingpong_dest *my_dest, struct pingpong_dest *rem_dest)
@@ -2890,21 +2913,47 @@ int create_rdma_cm_connection(struct pingpong_context *ctx,
 	int rc;
 	char *error_message;
 	struct rdma_addrinfo hints;
+
+	fprintf(stderr, "[DEBUG] create_rdma_cm_connection [%s]: Starting RDMA CM connection setup\n",
+	        user_param->machine == SERVER ? "SERVER" : "CLIENT");
+
 	memset(&hints, 0, sizeof(hints));
 	ctx->cma_master.connects_left = user_param->num_of_qps;
 
+	/* 步骤 1: 创建 RDMA CM 事件通道
+	 * Event channel 用于接收连接相关的异步事件
+	 * 例如：CONNECT_REQUEST, ESTABLISHED, DISCONNECTED 等
+	 */
+	fprintf(stderr, "[DEBUG] create_rdma_cm_connection [%s]: Creating event channel\n",
+	        user_param->machine == SERVER ? "SERVER" : "CLIENT");
 	ctx->cma_master.channel = rdma_create_event_channel();
 	if (!ctx->cma_master.channel) {
 		error_message = "Failed to create RDMA CM event channel.";
 		goto error;
 	}
 
+	/* 步骤 2: 分配 RDMA CM 节点（为每个 QP 创建 rdma_cm_id）
+	 * rdma_cm_id 是 RDMA CM 的核心数据结构，包含：
+	 * - 事件通道
+	 * - QP 指针
+	 * - 连接状态
+	 * - 地址信息
+	 */
+	fprintf(stderr, "[DEBUG] create_rdma_cm_connection [%s]: Allocating %d RDMA CM nodes\n",
+	        user_param->machine == SERVER ? "SERVER" : "CLIENT",
+	        user_param->num_of_qps);
 	rc = rdma_cm_allocate_nodes(ctx, user_param, &hints);
 	if (rc) {
 		error_message = "Failed to allocate RDMA CM nodes.";
 		goto destroy_event_channel;
 	}
 
+	/* 步骤 3: 第一次握手 - 交换初始信息
+	 * 在建立 RDMA CM 连接前，CLIENT 和 SERVER 需要同步
+	 * 例如：交换地址信息、确认双方就绪等
+	 */
+	fprintf(stderr, "[DEBUG] create_rdma_cm_connection [%s]: First handshake before connection\n",
+	        user_param->machine == SERVER ? "SERVER" : "CLIENT");
 	rc = ctx_hand_shake(comm, &my_dest[0], &rem_dest[0]);
 	if (rc) {
 		error_message = "Failed to sync between client and server "
@@ -2912,9 +2961,15 @@ int create_rdma_cm_connection(struct pingpong_context *ctx,
 		goto destroy_rdma_id;
 	}
 
+	/* 步骤 4: 执行 CLIENT 或 SERVER 特定的连接流程
+	 * CLIENT: 主动发起连接（resolve_addr → resolve_route → connect）
+	 * SERVER: 被动等待连接（bind → listen → accept）
+	 */
 	if (user_param->machine == CLIENT) {
+		fprintf(stderr, "[DEBUG] create_rdma_cm_connection [CLIENT]: Initiating client-side connection\n");
 		rc = rdma_cm_client_connection(ctx, user_param, &hints);
 	} else {
+		fprintf(stderr, "[DEBUG] create_rdma_cm_connection [SERVER]: Initiating server-side connection\n");
 		rc = rdma_cm_server_connection(ctx, user_param, &hints);
 	}
 
@@ -2924,6 +2979,14 @@ int create_rdma_cm_connection(struct pingpong_context *ctx,
 		goto destroy_event_channel;
 	}
 
+	/* 步骤 5: 第二次握手 - 确认连接建立成功
+	 * 连接建立后，双方再次同步，确保：
+	 * - 连接状态一致
+	 * - MR 信息已交换（rkey 等）
+	 * - 准备开始 RDMA 操作
+	 */
+	fprintf(stderr, "[DEBUG] create_rdma_cm_connection [%s]: Second handshake after connection\n",
+	        user_param->machine == SERVER ? "SERVER" : "CLIENT");
 	rc = ctx_hand_shake(comm, &my_dest[0], &rem_dest[0]);
 	if (rc) {
 		error_message = "Failed to sync between client and server "
@@ -2932,6 +2995,9 @@ int create_rdma_cm_connection(struct pingpong_context *ctx,
 	}
 
 	free(hints.ai_src_addr);
+
+	fprintf(stderr, "[DEBUG] create_rdma_cm_connection [%s]: RDMA CM connection established successfully\n",
+	        user_param->machine == SERVER ? "SERVER" : "CLIENT");
 
 	return rc;
 

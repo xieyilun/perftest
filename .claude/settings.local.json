@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nAdd Chinese comments and debug logs for RDMA WRITE flow\n\nThis commit adds comprehensive Chinese comments and debug logging to\nhelp understand the RDMA WRITE bandwidth test execution flow, with\nspecific focus on:\n\n1. Parameter parsing \\(-R and -D flags\\)\n   - -R: Enable RDMA CM connection management\n   - -D: Set test duration in seconds \\(DURATION mode\\)\n\n2. Distinguished CLIENT and SERVER roles\n   - CLIENT: Active side, performs RDMA WRITE operations\n   - SERVER: Passive side, provides remote memory \\(zero CPU overhead\\)\n\n3. Key RDMA parameters and operations\n   - WQE configuration \\(remote_addr, rkey, opcode\\)\n   - ibv_post_send\\(\\) and ibv_poll_cq\\(\\) flow\n   - Single-sided operation characteristics\n\n4. Added comprehensive documentation\n   - RDMA_WRITE_FLOW_CN.md: Complete flow explanation in Chinese\n   - CLIENT/SERVER behavior comparison\n   - Debug log examples\n\nModified files:\n- src/write_bw.c: Main program flow with CLIENT/SERVER distinction\n- src/perftest_parameters.c: Parameter parsing comments\n- src/perftest_resources.c: RDMA operation details\n- RDMA_WRITE_FLOW_CN.md: Comprehensive Chinese documentation\n\n🤖 Generated with [Claude Code]\\(https://claude.com/claude-code\\)\n\nCo-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git config:*)",
+      "Bash(git remote add:*)",
+      "Bash(git push:*)",
+      "Bash(git add:*)"
+    ]
+  }
+}

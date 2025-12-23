@@ -2917,6 +2917,22 @@ int create_qp_main(struct pingpong_context *ctx,
 	return ret;
 }
 
+/* ctx_qp_create 函数: 创建 Queue Pair (QP)
+ *
+ * QP 是 RDMA 通信的核心，相当于 socket 连接的端点
+ *
+ * QP 包含两个队列：
+ * - Send Queue (SQ): 发送工作请求 (WR) 队列
+ * - Receive Queue (RQ): 接收工作请求 (WR) 队列
+ *
+ * 在 RDMA WRITE 测试中：
+ * - CLIENT: 需要 SQ 来 post RDMA WRITE 请求，不需要 RQ（单边操作）
+ * - SERVER: 实际上两个队列都不主动使用（被动接收，硬件处理）
+ *
+ * 使用 RDMA CM (-R 参数) 时：
+ * - QP 通过 rdma_create_qp() 创建，并自动绑定到 rdma_cm_id
+ * - RDMA CM 会自动管理 QP 状态转换 (INIT → RTR → RTS)
+ */
 struct ibv_qp* ctx_qp_create(struct pingpong_context *ctx,
 		struct perftest_parameters *user_param, int qp_index)
 {
@@ -2927,6 +2943,9 @@ struct ibv_qp* ctx_qp_create(struct pingpong_context *ctx,
 	struct ibv_qp_init_attr attr;
 	memset(&attr, 0, sizeof(struct ibv_qp_init_attr));
 	struct ibv_qp_cap *qp_cap = &attr.cap;
+
+	fprintf(stderr, "[DEBUG] ctx_qp_create [%s]: Creating QP #%d\n",
+		user_param->machine == SERVER ? "SERVER" : "CLIENT", qp_index);
 
 	#ifdef HAVE_IBV_WR_API
 	enum ibv_wr_opcode opcode;
@@ -2949,21 +2968,61 @@ struct ibv_qp* ctx_qp_create(struct pingpong_context *ctx,
 	struct hnsdv_qp_init_attr hns_attr = {};
 	#endif
 
+	/* 配置 Completion Queue (CQ)
+	 * - send_cq: 发送完成队列，所有 QP 都需要
+	 * - recv_cq: 接收完成队列，取决于操作类型：
+	 *   * SEND/WRITE_IMM: 需要独立的 recv_cq（接收端需要 poll）
+	 *   * WRITE/READ: 使用 send_cq（单边操作，接收端不需要 poll）
+	 *
+	 * 在 RDMA WRITE 测试中：
+	 * - CLIENT: 只需要 poll send_cq（检查 WRITE 完成）
+	 * - SERVER: 不需要 poll 任何 CQ（被动接收，硬件处理）
+	 */
 	attr.send_cq = ctx->send_cq;
 	attr.recv_cq = (user_param->verb == SEND || user_param->verb == WRITE_IMM) ? ctx->recv_cq : ctx->send_cq;
+	fprintf(stderr, "[DEBUG] ctx_qp_create: CQ assignment - send_cq=%p, recv_cq=%p\n",
+		attr.send_cq, attr.recv_cq);
 
 	is_dc_server_side = ((!(user_param->duplex || user_param->tst == LAT) &&
 						  (user_param->machine == SERVER)) ||
 						 ((user_param->duplex || user_param->tst == LAT) &&
 						  (qp_index >= dc_num_of_qps)));
 
+	/* 配置 QP 容量参数（Capacity）
+	 * - max_inline_data: 内联数据大小（数据直接放入 WQE，不需要 MR）
+	 *   * 来源：-I 参数或自动计算（user_param->inline_size）
+	 * - max_send_wr: 发送队列深度（Send Queue Depth）
+	 *   * 来源：-t 参数，默认 128（write_bw）
+	 *   * CLIENT 会循环 post 这么多 WQE 后再 poll
+	 * - max_send_sge: 发送 Scatter-Gather Entry 数量
+	 *   * 每个 WQE 可以包含多个内存片段
+	 *   * 默认 MAX_SEND_SGE (通常为 1)
+	 *
+	 * 在 RDMA WRITE 测试中：
+	 * - CLIENT: max_send_wr 决定了并发的 WRITE 请求数（tx_depth）
+	 * - SERVER: 虽然配置了这些参数，但实际不使用 Send Queue
+	 */
 	attr.cap.max_inline_data = user_param->inline_size;
 	if (!(user_param->connection_type == DC &&
 			is_dc_server_side)) {
 		attr.cap.max_send_wr  = user_param->tx_depth;
 		attr.cap.max_send_sge = MAX_SEND_SGE;
 	}
+	fprintf(stderr, "[DEBUG] ctx_qp_create: Send queue - max_send_wr=%d, max_send_sge=%d, max_inline_data=%d\n",
+		attr.cap.max_send_wr, attr.cap.max_send_sge, attr.cap.max_inline_data);
 
+	/* 配置接收队列参数（Receive Queue）
+	 * - max_recv_wr: 接收队列深度（Receive Queue Depth）
+	 *   * 来源：-r 参数，默认 512（write_bw）
+	 * - max_recv_sge: 接收 Scatter-Gather Entry 数量
+	 *   * 默认 MAX_RECV_SGE (通常为 1)
+	 * - SRQ (Shared Receive Queue): 多个 QP 共享一个接收队列
+	 *
+	 * 在 RDMA WRITE 测试中：
+	 * - CLIENT: 不需要接收队列（单边操作，不接收数据）
+	 * - SERVER: 同样不需要接收队列（数据直接 DMA 到指定内存）
+	 * - 但为了兼容性和初始化流程，仍会配置这些参数
+	 */
 	if (user_param->use_srq &&
 			(user_param->tst == LAT ||
 			 user_param->machine == SERVER ||
@@ -2973,14 +3032,32 @@ struct ibv_qp* ctx_qp_create(struct pingpong_context *ctx,
 			attr.cap.max_recv_wr  = 0;
 			attr.cap.max_recv_sge = 0;
 		}
+		fprintf(stderr, "[DEBUG] ctx_qp_create: Using SRQ (Shared Receive Queue)\n");
 	} else {
 		attr.srq = NULL;
 		if (user_param->connection_type != DC) {
 			attr.cap.max_recv_wr  = user_param->rx_depth;
 			attr.cap.max_recv_sge = MAX_RECV_SGE;
 		}
+		fprintf(stderr, "[DEBUG] ctx_qp_create: Receive queue - max_recv_wr=%d, max_recv_sge=%d\n",
+			attr.cap.max_recv_wr, attr.cap.max_recv_sge);
 	}
 
+	/* 设置 QP 类型（QP Type）
+	 * - RC (Reliable Connection): 可靠连接，支持所有 RDMA 操作
+	 *   * write_bw 默认使用 RC
+	 *   * 提供可靠传输保证（ACK/NACK 机制）
+	 *   * 支持 SEND, WRITE, READ, ATOMIC 操作
+	 * - UC (Unreliable Connection): 不可靠连接
+	 *   * 不支持 RDMA READ 和 ATOMIC
+	 * - UD (Unreliable Datagram): 无连接数据报
+	 *   * 只支持 SEND 操作
+	 * - DC (Dynamically Connected): 动态连接（Mellanox 特性）
+	 * - RawEth: 原始以太网包
+	 * - SRD: Scalable Reliable Datagram（AWS EFA 特性）
+	 *
+	 * 来源：-c 参数，默认 RC
+	 */
 	switch (user_param->connection_type) {
 
 		case RC : attr.qp_type = IBV_QPT_RC; break;
@@ -2998,7 +3075,22 @@ struct ibv_qp* ctx_qp_create(struct pingpong_context *ctx,
 		default:  fprintf(stderr, "Unknown connection type \n");
 			  return NULL;
 	}
+	fprintf(stderr, "[DEBUG] ctx_qp_create: QP type set to %d (RC=2, UC=3, UD=4)\n", attr.qp_type);
 
+	/* 设置操作标志（Send Operation Flags）
+	 * 这些标志告诉硬件该 QP 支持哪些 RDMA 操作类型
+	 * 只有新版 WR API (IBV_WR_API) 才需要显式设置
+	 *
+	 * 在 write_bw 中（user_param->verb == WRITE）：
+	 * - opcode = IBV_WR_RDMA_WRITE
+	 * - 设置 IBV_QP_EX_WITH_RDMA_WRITE 标志
+	 * - 这允许 QP 执行 RDMA WRITE 操作
+	 *
+	 * RDMA WRITE 的特点：
+	 * - 单边操作（One-sided）
+	 * - CLIENT 在 WQE 中指定 SERVER 的远程地址和 rkey
+	 * - SERVER 端不需要 post receive，数据直接 DMA 到指定内存
+	 */
 	#ifdef HAVE_IBV_WR_API
 	if (user_param->verb == ATOMIC) {
 		opcode = opcode_atomic_array[user_param->atomicType];
@@ -3013,8 +3105,10 @@ struct ibv_qp* ctx_qp_create(struct pingpong_context *ctx,
 		if(0);
 		else if (opcode == IBV_WR_SEND)
 			attr_ex.send_ops_flags |= IBV_QP_EX_WITH_SEND;
-		else if (opcode == IBV_WR_RDMA_WRITE)
+		else if (opcode == IBV_WR_RDMA_WRITE) {
 			attr_ex.send_ops_flags |= IBV_QP_EX_WITH_RDMA_WRITE;
+			fprintf(stderr, "[DEBUG] ctx_qp_create: Set IBV_QP_EX_WITH_RDMA_WRITE flag for WRITE operation\n");
+		}
 		else if (opcode == IBV_WR_RDMA_WRITE_WITH_IMM)
 			attr_ex.send_ops_flags |= IBV_QP_EX_WITH_RDMA_WRITE_WITH_IMM;
 		else if (opcode == IBV_WR_RDMA_READ)
@@ -3035,10 +3129,41 @@ struct ibv_qp* ctx_qp_create(struct pingpong_context *ctx,
 	attr_ex.cap.max_recv_sge = attr.cap.max_recv_sge;
 	#endif
 
+	/* RDMA CM 路径：使用 -R 参数时通过 RDMA CM 创建 QP
+	 *
+	 * RDMA CM (Connection Manager) 是更高层的连接管理接口，类似于 socket API
+	 * 提供以下便利：
+	 * - 自动地址解析和路由查找
+	 * - 自动 QP 状态转换（INIT → RTR → RTS）
+	 * - 统一的连接建立流程（CLIENT/SERVER）
+	 *
+	 * QP 创建方式：
+	 * 1. 新版 API: rdma_create_qp_ex() - 支持扩展属性（attr_ex）
+	 *    - 需要显式设置 send_ops_flags（如 IBV_QP_EX_WITH_RDMA_WRITE）
+	 *    - 支持新的 WR API（ibv_wr_start/ibv_wr_complete）
+	 * 2. 旧版 API: rdma_create_qp() - 使用标准属性（attr）
+	 *    - 兼容旧的 ibv_post_send API
+	 *
+	 * QP 与 rdma_cm_id 的关系：
+	 * - QP 会自动绑定到 ctx->cm_id（rdma_cm_id 结构）
+	 * - QP 通过 ctx->cm_id->qp 访问
+	 * - RDMA CM 事件会自动更新 QP 状态
+	 *
+	 * 在 RDMA WRITE 测试中：
+	 * - CLIENT: 使用这个 QP 执行 ibv_post_send(IBV_WR_RDMA_WRITE)
+	 * - SERVER: QP 被创建但主要用于接收连接，测试期间不主动使用
+	 *
+	 * 与传统 ibv_create_qp() 的区别：
+	 * - 传统方式需要手动 modify_qp 转换状态，手动交换 QPN/LID/GID
+	 * - RDMA CM 方式自动处理所有这些细节
+	 */
 	if (user_param->work_rdma_cm) {
+		fprintf(stderr, "[DEBUG] ctx_qp_create [%s]: Using RDMA CM to create QP (bound to rdma_cm_id)\n",
+			user_param->machine == SERVER ? "SERVER" : "CLIENT");
 		#ifdef HAVE_IBV_WR_API
 		if (!user_param->use_old_post_send)
 		{
+			fprintf(stderr, "[DEBUG] ctx_qp_create: Creating QP with new API (rdma_create_qp_ex)\n");
 			if (rdma_create_qp_ex(ctx->cm_id, &attr_ex))
 			{
 				fprintf(stderr, "Couldn't create rdma new QP - %s\n", strerror(errno));
@@ -3046,10 +3171,15 @@ struct ibv_qp* ctx_qp_create(struct pingpong_context *ctx,
 			else
 			{
 				qp = ctx->cm_id->qp;
+				fprintf(stderr, "[DEBUG] ctx_qp_create: RDMA CM QP created successfully via rdma_create_qp_ex\n");
+				fprintf(stderr, "[DEBUG]   - QP bound to rdma_cm_id: %p\n", ctx->cm_id);
+				fprintf(stderr, "[DEBUG]   - QP number (qp_num): %u\n", qp->qp_num);
+				fprintf(stderr, "[DEBUG]   - QP will be auto-managed by RDMA CM (state transitions handled automatically)\n");
 			}
 		}
 		else
 		#endif
+			fprintf(stderr, "[DEBUG] ctx_qp_create: Creating QP with old API (rdma_create_qp)\n");
 			if (rdma_create_qp(ctx->cm_id, ctx->pd, &attr))
 			{
 				fprintf(stderr, "Couldn't create rdma old QP - %s\n", strerror(errno));
@@ -3057,6 +3187,10 @@ struct ibv_qp* ctx_qp_create(struct pingpong_context *ctx,
 			else
 			{
 				qp = ctx->cm_id->qp;
+				fprintf(stderr, "[DEBUG] ctx_qp_create: RDMA CM QP created successfully via rdma_create_qp\n");
+				fprintf(stderr, "[DEBUG]   - QP bound to rdma_cm_id: %p\n", ctx->cm_id);
+				fprintf(stderr, "[DEBUG]   - QP number (qp_num): %u\n", qp->qp_num);
+				fprintf(stderr, "[DEBUG]   - QP will be auto-managed by RDMA CM (state transitions handled automatically)\n");
 			}
 
 	} else if (user_param->connection_type == SRD) {
@@ -3189,6 +3323,26 @@ struct ibv_qp* ctx_qp_create(struct pingpong_context *ctx,
 		printf("  Actual inline-size(%d) < requested inline-size(%d)\n",
 			qp_cap->max_inline_data, user_param->inline_size);
 		user_param->inline_size = qp_cap->max_inline_data;
+	}
+
+	/* 最终 QP 创建结果汇总 */
+	if (qp != NULL) {
+		fprintf(stderr, "[DEBUG] ctx_qp_create [%s]: QP #%d created successfully\n",
+			user_param->machine == SERVER ? "SERVER" : "CLIENT", qp_index);
+		fprintf(stderr, "[DEBUG]   - QP number: %u\n", qp->qp_num);
+		fprintf(stderr, "[DEBUG]   - QP type: %d (RC=2, UC=3, UD=4)\n", attr.qp_type);
+		fprintf(stderr, "[DEBUG]   - Send queue: max_wr=%d, max_sge=%d, max_inline=%d\n",
+			qp_cap->max_send_wr, qp_cap->max_send_sge, qp_cap->max_inline_data);
+		fprintf(stderr, "[DEBUG]   - Recv queue: max_wr=%d, max_sge=%d\n",
+			qp_cap->max_recv_wr, qp_cap->max_recv_sge);
+		fprintf(stderr, "[DEBUG]   - RDMA CM managed: %s\n",
+			user_param->work_rdma_cm ? "YES (auto state transitions)" : "NO (manual modify_qp needed)");
+		if (user_param->verb == WRITE) {
+			fprintf(stderr, "[DEBUG]   - Operation: RDMA WRITE (single-sided, CLIENT post WRITE, SERVER passive)\n");
+		}
+	} else {
+		fprintf(stderr, "[ERROR] ctx_qp_create [%s]: Failed to create QP #%d\n",
+			user_param->machine == SERVER ? "SERVER" : "CLIENT", qp_index);
 	}
 
 	return qp;

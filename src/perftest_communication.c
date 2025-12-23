@@ -1482,6 +1482,47 @@ int establish_connection(struct perftest_comm *comm)
 /******************************************************************************
  *
  ******************************************************************************/
+/* ctx_hand_shake 函数: CLIENT 和 SERVER 之间交换连接参数
+ *
+ * 这是 RDMA 连接建立过程中的关键步骤，用于交换双方的连接信息
+ *
+ * 功能：
+ * - CLIENT 和 SERVER 交换 pingpong_dest 结构体中的信息
+ * - 包含 QP 连接所需的所有参数
+ *
+ * pingpong_dest 结构体包含的关键信息：
+ * - lid: Local Identifier（InfiniBand 地址）
+ * - qpn: QP Number（队列对编号）
+ * - psn: Packet Sequence Number（包序列号）
+ * - vaddr: Virtual Address（远程内存的虚拟地址）
+ * - rkey: Remote Key（远程内存访问密钥，从 MR 注册时获得）
+ * - gid: Global Identifier（RoCE/IB 全局标识符）
+ * - srqn: Shared Receive Queue Number（如果使用 SRQ）
+ *
+ * 在 RDMA WRITE 测试中的作用：
+ * 1. SERVER 端：
+ *    - 发送自己的 vaddr 和 rkey 给 CLIENT
+ *    - 这是 SERVER 注册 MR 后生成的远程内存信息
+ *    - CLIENT 需要这些信息才能执行 RDMA WRITE
+ * 2. CLIENT 端：
+ *    - 接收 SERVER 的 vaddr 和 rkey
+ *    - 将这些信息配置到 WQE 中（wr.rdma.remote_addr 和 wr.rdma.rkey）
+ *    - 使用这些信息执行 RDMA WRITE 操作
+ *
+ * 交换方式：
+ * - 如果使用 RDMA CM (-R 参数): 通过 rdma_read_keys/rdma_write_keys
+ * - 否则：通过 TCP socket (ethernet_read_keys/ethernet_write_keys)
+ *
+ * 交换顺序：
+ * - CLIENT (servername != NULL): 先写后读（先发送自己的信息，再接收 SERVER 的）
+ * - SERVER (servername == NULL): 先读后写（先接收 CLIENT 的信息，再发送自己的）
+ * - 这种顺序避免了死锁
+ *
+ * 参数：
+ * - comm: 通信上下文，包含 socket 或 RDMA CM 通道
+ * - my_dest: 本地的连接信息（要发送给对方的）
+ * - rem_dest: 远程的连接信息（从对方接收的，输出参数）
+ */
 int ctx_hand_shake(struct perftest_comm *comm,
 		struct pingpong_dest *my_dest,
 		struct pingpong_dest *rem_dest)
@@ -1489,39 +1530,101 @@ int ctx_hand_shake(struct perftest_comm *comm,
 	int (*read_func_ptr) (struct pingpong_dest*,struct perftest_comm*);
 	int (*write_func_ptr)(struct pingpong_dest*,struct perftest_comm*);
 
+	fprintf(stderr, "[DEBUG] ctx_hand_shake [%s]: Starting parameter exchange\n",
+		comm->rdma_params->servername ? "CLIENT" : "SERVER");
+
+	/* 选择参数交换的传输方式
+	 * - RDMA CM 模式 (-R 或 -z 参数): 使用 RDMA CM 通道交换
+	 * - 传统模式: 使用 TCP socket 交换
+	 */
 	if (comm->rdma_params->use_rdma_cm || comm->rdma_params->work_rdma_cm) {
 		read_func_ptr  = &rdma_read_keys;
 		write_func_ptr = &rdma_write_keys;
+		fprintf(stderr, "[DEBUG] ctx_hand_shake: Using RDMA CM for parameter exchange\n");
 
 	} else {
 		read_func_ptr  = &ethernet_read_keys;
 		write_func_ptr = &ethernet_write_keys;
+		fprintf(stderr, "[DEBUG] ctx_hand_shake: Using TCP socket for parameter exchange\n");
 
 	}
 
+	/* 同步 GID index */
 	rem_dest->gid_index = my_dest->gid_index;
+
+	/* CLIENT 端交换流程（servername != NULL 表示这是 CLIENT）
+	 * 顺序：先写后读
+	 * 1. 发送本地信息 (my_dest) 到 SERVER
+	 * 2. 接收 SERVER 的信息 (rem_dest)
+	 *
+	 * CLIENT 发送的关键信息：
+	 * - QPN, LID, GID: 用于 SERVER 修改 QP 状态到 RTS
+	 * - vaddr, rkey: CLIENT 的内存信息（虽然 WRITE 测试中 SERVER 不主动使用）
+	 *
+	 * CLIENT 接收的关键信息：
+	 * - QPN, LID, GID: 用于 CLIENT 修改 QP 状态到 RTS
+	 * - **vaddr, rkey**: SERVER 的远程内存地址和访问密钥（RDMA WRITE 的目标！）
+	 */
 	if (comm->rdma_params->servername) {
+		fprintf(stderr, "[DEBUG] ctx_hand_shake [CLIENT]: Sending my connection info to SERVER\n");
+		fprintf(stderr, "[DEBUG]   - My QPN: %d, LID: %d\n", my_dest->qpn, my_dest->lid);
+		fprintf(stderr, "[DEBUG]   - My vaddr: 0x%llx, rkey: 0x%x\n", my_dest->vaddr, my_dest->rkey);
+
 		if ((*write_func_ptr)(my_dest,comm)) {
 			fprintf(stderr," Unable to write to socket/rdma_cm\n");
 			return 1;
 		}
+
+		fprintf(stderr, "[DEBUG] ctx_hand_shake [CLIENT]: Waiting to receive SERVER's connection info\n");
 		if ((*read_func_ptr)(rem_dest,comm)) {
 			fprintf(stderr," Unable to read from socket/rdma_cm\n");
 			return 1;
 		}
 
+		fprintf(stderr, "[DEBUG] ctx_hand_shake [CLIENT]: Received SERVER's connection info\n");
+		fprintf(stderr, "[DEBUG]   - SERVER QPN: %d, LID: %d\n", rem_dest->qpn, rem_dest->lid);
+		fprintf(stderr, "[DEBUG]   - **SERVER vaddr: 0x%llx, rkey: 0x%x** (RDMA WRITE target!)\n",
+			rem_dest->vaddr, rem_dest->rkey);
+
 		/*Server side will wait for the client side to reach the write function.*/
 	} else {
+		/* SERVER 端交换流程（servername == NULL 表示这是 SERVER）
+		 * 顺序：先读后写
+		 * 1. 接收 CLIENT 的信息 (rem_dest)
+		 * 2. 发送本地信息 (my_dest) 到 CLIENT
+		 *
+		 * SERVER 接收的关键信息：
+		 * - QPN, LID, GID: 用于 SERVER 修改 QP 状态到 RTS
+		 * - vaddr, rkey: CLIENT 的内存信息
+		 *
+		 * SERVER 发送的关键信息：
+		 * - QPN, LID, GID: 用于 CLIENT 修改 QP 状态到 RTS
+		 * - **vaddr, rkey**: 这是 SERVER MR 注册后生成的，CLIENT 需要这些信息执行 RDMA WRITE！
+		 */
+		fprintf(stderr, "[DEBUG] ctx_hand_shake [SERVER]: Waiting to receive CLIENT's connection info\n");
 
 		if ((*read_func_ptr)(rem_dest,comm)) {
 			fprintf(stderr," Unable to read to socket/rdma_cm\n");
 			return 1;
 		}
+
+		fprintf(stderr, "[DEBUG] ctx_hand_shake [SERVER]: Received CLIENT's connection info\n");
+		fprintf(stderr, "[DEBUG]   - CLIENT QPN: %d, LID: %d\n", rem_dest->qpn, rem_dest->lid);
+		fprintf(stderr, "[DEBUG]   - CLIENT vaddr: 0x%llx, rkey: 0x%x\n", rem_dest->vaddr, rem_dest->rkey);
+
+		fprintf(stderr, "[DEBUG] ctx_hand_shake [SERVER]: Sending my connection info to CLIENT\n");
+		fprintf(stderr, "[DEBUG]   - My QPN: %d, LID: %d\n", my_dest->qpn, my_dest->lid);
+		fprintf(stderr, "[DEBUG]   - **My vaddr: 0x%llx, rkey: 0x%x** (CLIENT will WRITE here!)\n",
+			my_dest->vaddr, my_dest->rkey);
+
 		if ((*write_func_ptr)(my_dest,comm)) {
 			fprintf(stderr," Unable to write from socket/rdma_cm\n");
 			return 1;
 		}
 	}
+
+	fprintf(stderr, "[DEBUG] ctx_hand_shake [%s]: Parameter exchange completed successfully\n",
+		comm->rdma_params->servername ? "CLIENT" : "SERVER");
 
 	return 0;
 }
